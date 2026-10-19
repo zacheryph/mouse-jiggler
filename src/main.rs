@@ -1,12 +1,13 @@
-#![allow(dead_code)]
-
-use esp32_nimble::{
-    enums::*, hid::*, utilities::mutex::Mutex, BLECharacteristic, BLEDevice, BLEHIDDevice,
-    BLEServer,
-};
 use esp_idf_sys as _;
+use esp32_nimble::{
+    BLEAdvertisementData, BLECharacteristic, BLEDevice, BLEHIDDevice, BLEServer, enums::*, hid::*,
+    utilities::mutex::Mutex,
+};
 use std::sync::Arc;
+use zerocopy::IntoBytes;
+use zerocopy_derive::{Immutable, IntoBytes};
 
+const BLE_DEVICE_NAME: &str = env!("BLE_DEVICE_NAME");
 const MOUSE_ID: u8 = 0x01;
 
 const HID_REPORT_DESCRIPTOR: &[u8] = hid!(
@@ -51,6 +52,9 @@ const HID_REPORT_DESCRIPTOR: &[u8] = hid!(
     (END_COLLECTION),        // END_COLLECTION
 );
 
+const DELAY: esp_idf_hal::delay::Delay = esp_idf_hal::delay::Delay::new_default();
+
+#[derive(Immutable, IntoBytes)]
 #[repr(packed)]
 struct MouseReport {
     buttons: u8,
@@ -68,33 +72,65 @@ struct Mouse {
 
 impl Mouse {
     fn new() -> Self {
-        let device = BLEDevice::take();
-        device
-            .security()
-            .set_auth(AuthReq::all())
-            .set_io_cap(SecurityIOCap::NoInputNoOutput);
+        BLEDevice::set_device_name(BLE_DEVICE_NAME).unwrap();
 
+        let device = BLEDevice::take();
         let server = device.get_server();
         let mut hid = BLEHIDDevice::new(server);
+        let ble_advertising = device.get_advertising();
+        let mut advertisement_data = BLEAdvertisementData::new();
+
+        device
+            .security()
+            .set_auth(AuthReq::Bond) // Bonding enables key storage for reconnection
+            .set_passkey(123456) // Optional, sets the passkey for pairing
+            .set_io_cap(SecurityIOCap::NoInputNoOutput) // You can choose any IO capability
+            .resolve_rpa(); // Crucial for managing iOS's dynamic Bluetooth addresses
+
+        server.on_connect(|server, desc| {
+            ::log::info!("Client connected: {:?}", desc);
+
+            if server.connected_count() < Self::max_connections() {
+                let mut advertise = ble_advertising.lock();
+                if advertise.is_advertising() {
+                    return;
+                }
+
+                ::log::info!("Multi-connect support: start advertising");
+                advertise.start().unwrap();
+            }
+        });
+
+        server.on_disconnect(|desc, err| {
+            ::log::info!("Client disconnected: {:?} => {:?}", desc, err);
+            let mut advertise = ble_advertising.lock();
+            if advertise.is_advertising() {
+                return;
+            }
+
+            advertise.start().unwrap();
+        });
 
         let input_mouse = hid.input_report(MOUSE_ID);
 
-        hid.manufacturer("ant.org");
+        hid.manufacturer("routine.sh");
         hid.pnp(0x02, 0x05ac, 0x820a, 0x0210);
         hid.hid_info(0x00, 0x02);
-
         hid.report_map(HID_REPORT_DESCRIPTOR);
-
         hid.set_battery_level(100);
 
-        let ble_advertising = device.get_advertising();
-        ble_advertising
-            .name("BTMouse")
+        advertisement_data
+            .name(BLE_DEVICE_NAME)
             .appearance(0x03C2) // 0x03c1 is KEYBOARD
-            .add_service_uuid(hid.hid_service().lock().uuid())
-            .scan_response(false);
+            .add_service_uuid(hid.hid_service().lock().uuid());
 
-        ble_advertising.start().unwrap();
+        {
+            // lock mutex once for all changes
+            let mut advertise = ble_advertising.lock();
+            advertise.scan_response(false);
+            advertise.set_data(&mut advertisement_data).unwrap();
+            advertise.start().unwrap();
+        }
 
         Self {
             server,
@@ -109,8 +145,16 @@ impl Mouse {
         }
     }
 
+    fn max_connections() -> usize {
+        esp_idf_svc::sys::CONFIG_BT_NIMBLE_MAX_CONNECTIONS as _
+    }
+
     fn connected(&self) -> bool {
-        self.server.connected_count() > 0
+        self.connected_count() > 0
+    }
+
+    fn connected_count(&self) -> usize {
+        self.server.connected_count()
     }
 
     fn click(&mut self, b: u8) {
@@ -127,36 +171,43 @@ impl Mouse {
     }
 
     fn send_report(&self, mouse: &MouseReport) {
-        self.input_mouse.lock().set_from(mouse).notify();
-        esp_idf_hal::delay::Ets::delay_ms(7);
+        self.input_mouse.lock().set_value(mouse.as_bytes()).notify();
+        DELAY.delay_ms(7);
     }
 }
 
 fn main() {
-    esp_idf_sys::link_patches();
+    // It is necessary to call this function once. Otherwise some patches to the runtime
+    // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
+    esp_idf_svc::sys::link_patches();
+
+    // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    // WDT OFF
-    // unsafe {
-    //     esp_idf_sys::esp_task_wdt_delete(esp_idf_sys::xTaskGetIdleTaskHandleForCPU(
-    //         esp_idf_hal::cpu::core() as u32,
-    //     ));
-    // };
+    log::info!("ESP Clicker Starting...");
+    log::info!("  - BLE Device Name: {}", BLE_DEVICE_NAME);
+    log::info!(
+        "  - Maximum Device Connections: {}",
+        Mouse::max_connections()
+    );
 
     let mut mouse = Mouse::new();
 
     loop {
+        ::log::info!("Sending jiggle to {} devices.", mouse.connected_count());
         if mouse.connected() {
-            ::log::info!("Sending mousage...");
+            mouse.click(1);
+            DELAY.delay_ms(50);
             mouse.move_mouse(10, 10, 0, 0);
-            esp_idf_hal::delay::FreeRtos::delay_ms(100);
+            DELAY.delay_ms(100);
             mouse.move_mouse(-10, -10, 0, 0);
-            esp_idf_hal::delay::FreeRtos::delay_ms(100);
+            DELAY.delay_ms(100);
             mouse.move_mouse(10, 10, 0, 0);
-            esp_idf_hal::delay::FreeRtos::delay_ms(100);
+            DELAY.delay_ms(100);
             mouse.move_mouse(-10, -10, 0, 0);
-            esp_idf_hal::delay::FreeRtos::delay_ms(100);
+            DELAY.delay_ms(50);
+            mouse.click(0);
         }
-        esp_idf_hal::delay::FreeRtos::delay_ms(60 * 1000);
+        DELAY.delay_ms(60 * 1000);
     }
 }
