@@ -7,6 +7,22 @@ It's a BLE HID peripheral that identifies as a mouse. It's indistinguishable fro
 regular bluetooth mouse, because it *is* a bluetooth mouse.
 
 
+# variants
+
+Two independent cargo projects live in this repo. They are the same
+firmware targeting different chips, not layers of each other — build them
+by `cd`ing into the directory you want.
+
+| path          | target                     | device name        |
+| ------------- | -------------------------- | ------------------ |
+| `.` (root)    | esp32c6 (`riscv32imac`)    | `BLE_DEVICE_NAME`  |
+| `esp-jiggler` | esp32c3 (`riscv32imc`)     | `ESP-Jiggler`      |
+
+Each has its own `.cargo/config.toml`, `sdkconfig.defaults` and
+`rust-toolchain.toml`. The root project sets the advertised name at build
+time from the `[env]` section; the esp32c3 variant hardcodes it.
+
+
 # setup
 
 ```
